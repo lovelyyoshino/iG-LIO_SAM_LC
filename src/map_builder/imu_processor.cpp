@@ -32,8 +32,11 @@ namespace lio
         acc_bias_cov_ = Eigen::Vector3d(acc_bias_cov, acc_bias_cov, acc_bias_cov);
     }
 
+    /// @brief IMU 初始化函数，用于静态估计重力和角速度偏置。
+    /// @param meas 包含IMU和点云数据的 MeasureGroup 对象。
     void IMUProcessor::init(const MeasureGroup &meas)
     {
+        //检查IMU数据是否为空
         if (meas.imus.empty())
             return;
 
@@ -41,6 +44,7 @@ namespace lio
 
         for (const auto &imu : meas.imus)
         {
+            //遍历 meas.imus 中的每个 IMU 数据，更新加速度和陀螺仪的平均值.使用逐步平均算法计算平均加速度和平均陀螺仪值
             init_count_++;
             mean_acc_ += (imu.acc - mean_acc_) / init_count_;
             mean_gyro_ += (imu.gyro - mean_gyro_) / init_count_;
@@ -57,6 +61,8 @@ namespace lio
         // TODO: 对于初始为非水平放置的情况进行重力对齐
         if (align_gravity_)
         {
+            //如果需要重力对齐，根据平均加速度计算初始旋转。
+
             // Eigen::Vector3d euler_angles = Eigen::Quaterniond::FromTwoVectors((-mean_acc_).normalized(), Eigen::Vector3d(0.0, 0.0, -1.0)).matrix().eulerAngles(0, 1, 2);
             // Eigen::AngleAxisd roll(euler_angles(0), Eigen::Vector3d::UnitX());
             // Eigen::AngleAxisd pitch(euler_angles(1), Eigen::Vector3d::UnitY());
@@ -64,6 +70,7 @@ namespace lio
             // std::cout << euler_angles(2) << std::endl;
 
             // Eigen::Matrix3d rot = (yaw * pitch * roll).matrix();
+            //将初始旋转设置为从 -mean_acc_ 向量到 (0,0,−1) 方向的旋转
             state.rot = (Eigen::Quaterniond::FromTwoVectors((-mean_acc_).normalized(), Eigen::Vector3d(0.0, 0.0, -1.0)).matrix());
             state.initG(Eigen::Vector3d(0, 0, -1.0));
         }
@@ -74,9 +81,9 @@ namespace lio
 
         //  v2 = q * v1
 
-        kf_->change_x(state);
+        kf_->change_x(state);//更新状态向量
 
-        // 初始化噪声的协方差矩阵
+        // 初始化噪声的协方差矩阵,设置状态协方差矩阵的初始值，表示初始状态的不确定性
         kf::Matrix23d init_P = kf_->P();
         init_P.setIdentity();
         init_P(6, 6) = init_P(7, 7) = init_P(8, 8) = 0.00001;
@@ -89,9 +96,12 @@ namespace lio
         last_imu_ = meas.imus.back();
     }
 
+    /// @brief 矫正点云畸变，根据IMU数据对点云进行去畸变处理
+    /// @param meas 包含IMU和点云数据的 MeasureGroup 对象
+    /// @param out 输出的矫正后的点云，类型为 PointCloudXYZI::Ptr
     void IMUProcessor::undistortPointcloud(const MeasureGroup &meas, PointCloudXYZI::Ptr &out)
     {
-
+        //将 IMU 数据转换为双端队列，并添加最后一个 IMU 数据到队首
         std::deque<IMU> v_imus(meas.imus.begin(), meas.imus.end());
         v_imus.push_front(last_imu_);
         const double imu_time_begin = v_imus.front().timestamp;
@@ -100,10 +110,10 @@ namespace lio
         const double lidar_time_end = meas.lidar_time_end;
 
         out = meas.lidar;
-
+        //按曲率排序点云，以确保点云按照扫描顺序处理
         std::sort(out->points.begin(), out->points.end(), [](PointType &p1, PointType &p2) -> bool
                   { return p1.curvature < p2.curvature; });
-
+        //初始化状态对象，并将其添加到 imu_poses_ 容器中
         kf::State state = kf_->x();
         imu_poses_.clear();
         imu_poses_.emplace_back(0.0, last_acc_, last_gyro_, state.vel, state.pos, state.rot);
@@ -120,6 +130,7 @@ namespace lio
             IMU &tail = *(it_imu + 1);
             if (tail.timestamp < last_lidar_time_end_)
                 continue;
+            //对 IMU 数据进行处理，计算加速度和角速度的中值
             gyro_val = 0.5 * (head.gyro + tail.gyro);
             acc_val = 0.5 * (head.acc + head.acc);
             // normalize acc
@@ -129,7 +140,7 @@ namespace lio
                 dt = tail.timestamp - last_lidar_time_end_;
             else
                 dt = tail.timestamp - head.timestamp;
-
+            //归一化加速度，并根据时间间隔 dt 预测下一时刻的状态
             Q_.block<3, 3>(0, 0).diagonal() = gyro_cov_;
             Q_.block<3, 3>(3, 3).diagonal() = acc_cov_;
             Q_.block<3, 3>(6, 6).diagonal() = gyro_bias_cov_;
@@ -164,6 +175,7 @@ namespace lio
 
         // 畸变矫正
         auto it_pcl = out->points.end() - 1;
+        //从最后一个点开始，逐点处理点云数据，根据 IMU 数据进行去畸变
         for (auto it_kp = imu_poses_.end() - 1; it_kp != imu_poses_.begin(); it_kp--)
         {
             auto head = it_kp - 1;
@@ -175,6 +187,7 @@ namespace lio
             Eigen::Vector3d imu_acc = tail->acc;
             Eigen::Vector3d imu_gyro = tail->gyro;
 
+            //计算点云点在时间上的位姿变化，并将其转换到当前时刻的位姿
             for (; it_pcl->curvature / double(1000) > head->offset; it_pcl--)
             {
                 dt = it_pcl->curvature / double(1000) - head->offset;
@@ -200,7 +213,7 @@ namespace lio
             init(meas);
             return false;
         }
-        undistortPointcloud(meas, out);
+        undistortPointcloud(meas, out);//对点云进行畸变矫正
         return true;
     }
 
